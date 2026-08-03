@@ -1,307 +1,243 @@
-// mmr-cli — real-world usage tests against the WMMR built DLLs.
-// Exercises the C export surface of wlidcli, uxctl, WLXVideoTrim,
-// WLXPipetran and MovieMakerCore using P/Invoke.
-using System.ComponentModel;
-using System.Runtime.InteropServices;
+using System.Diagnostics;
+using MmrCli.Framework;
+using MmrCli.Native;
+using MmrCli.Reporting;
+using MmrCli.Tests;
+using MmrCli.Workflows;
 
 namespace MmrCli;
 
 internal static class Program
 {
-    private static int _pass;
-    private static int _fail;
+    private sealed class Options
+    {
+        public string? BinDir;
+        public bool List;
+        public string? Filter;
+        public string? Skip;
+        public string? Dll;
+        public string? JUnit;
+        public string? Json;
+        public int? Retries;
+    }
 
     private static int Main(string[] args)
     {
-        Console.WriteLine("=== WMMR Live Usage Tests (mmr-cli) ===");
-        Console.WriteLine();
+        Options opts = Parse(args);
 
-        string bin = args.Length > 0
-            ? Path.GetFullPath(args[0])
-            : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "bin"));
+        string binDir = opts.BinDir
+            ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "bin"));
 
-        if (!Directory.Exists(bin))
+        var all = BuildSuite();
+
+        if (opts.List)
         {
-            Console.WriteLine($"[!] DLL directory not found: {bin}");
+            ListTests(all);
+            return (int)ExitCode.Success;
+        }
+
+        if (!Directory.Exists(binDir))
+        {
+            Console.WriteLine($"[!] DLL directory not found: {binDir}");
             Console.WriteLine("    Pass the path to build_clean/bin/Debug as the first argument.");
-            return 2;
+            return (int)ExitCode.EnvironmentError;
         }
 
-        // Set DLL search path before loading any native DLLs.
-        Native.SetDllDirectoryW(bin);
+        var tests = ApplyOptions(all, opts);
 
-        RunWlidcli(bin);
-        RunUxctl(bin);
-        RunVideoTrim(bin);
-        RunPipetran(bin);
-        RunMovieMakerCore(bin);
+        NativeBootstrap.SetDllSearchPath(binDir);
 
-        Console.WriteLine();
-        Console.WriteLine($"=== PASS={_pass} FAIL={_fail} ===");
-        return _fail == 0 ? 0 : 1;
+        var coverage = new CoverageTracker();
+        var ctx = new TestContext
+        {
+            BinDir = binDir,
+            Coverage = coverage,
+            Modules = new NativeModuleCache(),
+        };
+
+        using (ctx.Modules)
+        {
+            Console.WriteLine("=== WMMR Live Usage Tests (mmr-cli) ===");
+            Console.WriteLine($"bin: {binDir}");
+            Console.WriteLine($"tests: {tests.Count}  (dll filter: {opts.Dll ?? "*"} | filter: {opts.Filter ?? "*"} | skip: {opts.Skip ?? "-"})");
+            Console.WriteLine();
+
+            var sw = Stopwatch.StartNew();
+            IReadOnlyList<TestResult> results = new TestRunner().Run(ctx, tests);
+            sw.Stop();
+
+            foreach (var r in results)
+                PrintResult(r);
+
+            CollectCoverage(ctx, coverage);
+
+            Console.WriteLine();
+            PrintSummary(results, coverage, sw.Elapsed);
+
+            if (opts.JUnit is not null)
+            {
+                Reporters.WriteJUnit(opts.JUnit, results);
+                Console.WriteLine($"junit: {Path.GetFullPath(opts.JUnit)}");
+            }
+
+            if (opts.Json is not null)
+            {
+                Reporters.WriteJson(opts.Json, results);
+                Console.WriteLine($"json:  {Path.GetFullPath(opts.Json)}");
+            }
+
+            return results.Any(r => r.Status == TestStatus.Failed)
+                ? (int)ExitCode.TestFailure
+                : (int)ExitCode.Success;
+        }
     }
 
-    private static void Check(string name, Func<bool> fn)
+    private static Options Parse(string[] args)
     {
-        try
+        var o = new Options();
+        for (int i = 0; i < args.Length; i++)
         {
-            if (fn())
+            switch (args[i])
             {
-                _pass++;
-                Console.WriteLine($"  [PASS] {name}");
-            }
-            else
-            {
-                _fail++;
-                Console.WriteLine($"  [FAIL] {name}");
+                case "--list": o.List = true; break;
+                case "--filter": o.Filter = args[++i]; break;
+                case "--skip": o.Skip = args[++i]; break;
+                case "--dll": o.Dll = args[++i]; break;
+                case "--junit": o.JUnit = args[++i]; break;
+                case "--json": o.Json = args[++i]; break;
+                case "--retries": o.Retries = int.Parse(args[++i]); break;
+                default:
+                    if (o.BinDir is null && !args[i].StartsWith("--", StringComparison.Ordinal))
+                        o.BinDir = args[i];
+                    break;
             }
         }
-        catch (Exception ex)
-        {
-            _fail++;
-            Console.WriteLine($"  [FAIL] {name} — {ex.GetType().Name}: {ex.Message}");
-        }
+        return o;
     }
 
-    private static void RunWlidcli(string bin)
+    private static List<TestCase> BuildSuite()
     {
-        Console.WriteLine();
-        Console.WriteLine("[wlidcli.dll]");
-
-        IntPtr h = IntPtr.Zero;
-        try
-        {
-            h = Native.LoadLibrary(Path.Combine(bin, "wlidcli.dll"));
-            if (h == IntPtr.Zero)
-            {
-                Console.WriteLine("  [FAIL] LoadLibrary wlidcli.dll — " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
-                _fail++;
-                return;
-            }
-
-            Check("WLIsSignedIn(0) is FALSE before any sign-in call", () => Native.WLIsSignedIn(0) == 0);
-
-            Check("WLCheckCredentials(null) returns S_OK", () => Native.WLCheckCredentials(null) == 0);
-
-            Check("WLClogin(0, null, 0, out _) returns S_OK", () =>
-            {
-                int hr = Native.WLClogin(IntPtr.Zero, null, 0, out _);
-                return hr == 0;
-            });
-
-            Check("WLIsSignedIn(0) is TRUE after WLClogin", () => Native.WLIsSignedIn(0) != 0);
-
-            Check("WLCreateIdentityHandle() returns increasing nonzero handles", () =>
-            {
-                uint a = Native.WLCreateIdentityHandle();
-                uint b = Native.WLCreateIdentityHandle();
-                return a != 0 && b > a;
-            });
-
-            Check("WLGetEnvironment returns S_OK and 'production'", () =>
-            {
-                int hr = Native.WLGetEnvironment(out IntPtr envPtr);
-                string? env = envPtr == IntPtr.Zero ? null : Marshal.PtrToStringUni(envPtr);
-                bool ok = hr == 0 && env == "production";
-                if (envPtr != IntPtr.Zero) Native.WLFreeMemory(envPtr);
-                return ok;
-            });
-
-            Check("WLGetTicket(1) returns S_OK and a ticket", () =>
-            {
-                int hr = Native.WLGetTicket(1, out IntPtr ticketPtr);
-                if (hr != 0) return false;
-                string? ticket = Marshal.PtrToStringUni(ticketPtr);
-                bool ok = !string.IsNullOrEmpty(ticket) && ticket!.Contains("ticket=");
-                if (ticketPtr != IntPtr.Zero) Native.WLFreeMemory(ticketPtr);
-                return ok;
-            });
-        }
-        finally
-        {
-            if (h != IntPtr.Zero) Native.FreeLibrary(h);
-        }
+        var all = new List<TestCase>();
+        all.AddRange(ExportPresenceTests.All());
+        all.AddRange(ComSurfaceTests.All());
+        all.AddRange(BehaviorTests.All());
+        all.AddRange(WlidcliWorkflow.All());
+        all.AddRange(MovieMakerCoreWorkflow.All());
+        all.AddRange(VideoTrimWorkflow.All());
+        all.AddRange(PublishSubscribeWorkflow.All());
+        all.AddRange(Mp4ParserWorkflow.All());
+        all.AddRange(MetadataSysWorkflow.All());
+        all.AddRange(MfReadWriteWorkflow.All());
+        return all;
     }
 
-    private static void RunUxctl(string bin)
+    private static List<TestCase> ApplyOptions(List<TestCase> all, Options o)
     {
-        Console.WriteLine();
-        Console.WriteLine("[uxctl.dll]");
+        IEnumerable<TestCase> q = all;
 
-        IntPtr h = IntPtr.Zero;
-        try
+        if (o.Dll is not null)
+            q = q.Where(t => t.Dll.Equals(o.Dll, StringComparison.OrdinalIgnoreCase));
+
+        if (o.Filter is not null)
         {
-            h = Native.LoadLibrary(Path.Combine(bin, "uxctl.dll"));
-            if (h == IntPtr.Zero)
-            {
-                Console.WriteLine("  [FAIL] LoadLibrary uxctl.dll — " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
-                _fail++;
-                return;
-            }
-
-            Check("UxControlsInitProcess() returns S_OK", () => Native.UxControlsInitProcess() == 0);
-
-            Check("UxControlsCreateObject returns CLASS_E_CLASSNOTAVAILABLE", () =>
-                (uint)Native.UxControlsCreateObject(out _) == 0x80040111);
-
-            Check("UxControlsUninitProcess() is callable", () =>
-            {
-                Native.UxControlsUninitProcess();
-                return true;
-            });
+            string f = o.Filter;
+            q = q.Where(t => t.Id.Contains(f, StringComparison.OrdinalIgnoreCase)
+                             || t.Dll.Contains(f, StringComparison.OrdinalIgnoreCase)
+                             || t.Group.Contains(f, StringComparison.OrdinalIgnoreCase)
+                             || t.Description.Contains(f, StringComparison.OrdinalIgnoreCase));
         }
-        finally
+
+        var list = q.ToList();
+
+        if (o.Retries is not null)
+            list = list.Select(t => WithRetries(t, o.Retries.Value)).ToList();
+
+        if (o.Skip is not null)
         {
-            if (h != IntPtr.Zero) Native.FreeLibrary(h);
+            string s = o.Skip;
+            list = list.Select(t => t.Id.Contains(s, StringComparison.OrdinalIgnoreCase) ? Skipped(t) : t).ToList();
         }
+
+        return list;
     }
 
-    private static void RunVideoTrim(string bin)
+    private static TestCase WithRetries(TestCase t, int retries)
+        => T.Test(t.Dll, t.Group, t.Id, t.Description, t.Body, retries);
+
+    private static TestCase Skipped(TestCase t)
+        => T.Test(t.Dll, t.Group, t.Id, t.Description, t.Body, 0, skip: true);
+
+    private static void ListTests(List<TestCase> all)
     {
+        Console.WriteLine($"=== mmr-cli test suite: {all.Count} cases ===");
         Console.WriteLine();
-        Console.WriteLine("[WLXVideoTrim.dll]");
-
-        IntPtr h = IntPtr.Zero;
-        try
+        foreach (var g in all.GroupBy(t => t.Dll).OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase))
         {
-            h = Native.LoadLibrary(Path.Combine(bin, "WLXVideoTrim.dll"));
-            if (h == IntPtr.Zero)
-            {
-                Console.WriteLine("  [FAIL] LoadLibrary WLXVideoTrim.dll — " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
-                _fail++;
-                return;
-            }
-
-            Check("CreateVideoPlayer returns E_NOTIMPL", () => (uint)Native.CreateVideoPlayer(out _) == 0x80004001);
-
-            Check("CreateVideoFormatContextTranscoder returns E_NOTIMPL", () => (uint)Native.CreateVideoFormatContextTranscoder(out _) == 0x80004001);
-
-            Check("CreateVideoWMVTranscoder returns E_NOTIMPL", () => (uint)Native.CreateVideoWMVTranscoder(out _) == 0x80004001);
-
-            Check("CreateAVICopierDirect returns E_NOTIMPL", () => (uint)Native.CreateAVICopierDirect(out _) == 0x80004001);
-        }
-        finally
-        {
-            if (h != IntPtr.Zero) Native.FreeLibrary(h);
+            Console.WriteLine($"[{g.Key}]");
+            foreach (var t in g)
+                Console.WriteLine($"  {t.Id,-52} {t.Description}");
+            Console.WriteLine();
         }
     }
 
-    private static void RunPipetran(string bin)
+    private static void PrintResult(TestResult r)
     {
-        Console.WriteLine();
-        Console.WriteLine("[WLXPipetran.dll]");
-
-        IntPtr h = IntPtr.Zero;
-        try
+        string mark = r.Status switch
         {
-            h = Native.LoadLibrary(Path.Combine(bin, "WLXPipetran.dll"));
-            if (h == IntPtr.Zero)
-            {
-                Console.WriteLine("  [FAIL] LoadLibrary WLXPipetran.dll — " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
-                _fail++;
-                return;
-            }
-
-            Check("GetTFXCreateFunctions returns E_NOTIMPL with count==0", () =>
-            {
-                int hr = Native.GetTFXCreateFunctions(out _, out uint count);
-                return (uint)hr == 0x80004001 && count == 0;
-            });
-        }
-        finally
-        {
-            if (h != IntPtr.Zero) Native.FreeLibrary(h);
-        }
+            TestStatus.Passed => "PASS",
+            TestStatus.Skipped => "SKIP",
+            _ => "FAIL",
+        };
+        string msg = r.Status == TestStatus.Failed ? $" — {r.Message}" : "";
+        Console.WriteLine($"  [{mark}] {r.Id} ({r.DurationMs}ms){msg}");
     }
 
-    private static void RunMovieMakerCore(string bin)
+    private static void CollectCoverage(TestContext ctx, CoverageTracker coverage)
     {
-        Console.WriteLine();
-        Console.WriteLine("[MovieMakerCore.dll]");
-
-        IntPtr h = IntPtr.Zero;
-        try
+        foreach (var (dll, exports) in ExportCatalog.Catalogs)
         {
-            h = Native.LoadLibrary(Path.Combine(bin, "MovieMakerCore.dll"));
-            if (h == IntPtr.Zero)
+            coverage.RegisterExpected(dll, exports.Length);
+            try
             {
-                Console.WriteLine("  [FAIL] LoadLibrary MovieMakerCore.dll — " + new Win32Exception(Marshal.GetLastWin32Error()).Message);
-                _fail++;
-                return;
+                IntPtr h = ctx.LoadModule(dll);
+                int present = exports.Count(e => ctx.Modules.HasProc(h, e));
+                coverage.ReportPresent(dll, present);
             }
-
-            Check("MovieMakerMain(2, [MovieMaker.exe, --help]) returns 0", () =>
-                Native.MovieMakerMain(2, new[] { "MovieMaker.exe", "--help" }) == 0);
-        }
-        finally
-        {
-            if (h != IntPtr.Zero) Native.FreeLibrary(h);
+            catch
+            {
+                coverage.ReportPresent(dll, 0);
+            }
         }
     }
-}
 
-internal static partial class Native
-{
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    internal static extern IntPtr LoadLibrary(string lpFileName);
+    private static void PrintSummary(IReadOnlyList<TestResult> results, CoverageTracker coverage, TimeSpan elapsed)
+    {
+        int pass = results.Count(r => r.Status == TestStatus.Passed);
+        int fail = results.Count(r => r.Status == TestStatus.Failed);
+        int skip = results.Count(r => r.Status == TestStatus.Skipped);
+        Console.WriteLine($"=== PASS={pass} FAIL={fail} SKIP={skip}  ({elapsed.TotalSeconds:0.00}s) ===");
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static extern bool FreeLibrary(IntPtr hModule);
+        int dllsLoaded = coverage.Data.Count(kv => kv.Value.Present > 0);
+        Console.WriteLine($"=== coverage: {dllsLoaded}/{coverage.Data.Count} DLLs loaded, " +
+                          $"{coverage.TotalPresent}/{coverage.TotalExpected} exports present ===");
+        foreach (var kv in coverage.Data.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+            Console.WriteLine($"    {kv.Key,-35} {kv.Value.Present,3}/{kv.Value.Expected,-3}");
 
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    internal static extern bool SetDllDirectoryW(string lpPathName);
+        if (fail > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Failed cases:");
+            foreach (var r in results.Where(r => r.Status == TestStatus.Failed))
+                Console.WriteLine($"  [FAIL] {r.Id} — {r.Message}");
+        }
 
-    // ---- wlidcli.dll (all __stdcall) ----
-    [DllImport("wlidcli.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    internal static extern int WLGetEnvironment(out IntPtr env);
-
-    [DllImport("wlidcli.dll", SetLastError = true)]
-    internal static extern uint WLCreateIdentityHandle();
-
-    [DllImport("wlidcli.dll", SetLastError = true)]
-    internal static extern int WLIsSignedIn(uint handle);
-
-    [DllImport("wlidcli.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    internal static extern int WLClogin(IntPtr hwndParent, string? cred, uint flags, out IntPtr authState);
-
-    [DllImport("wlidcli.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    internal static extern int WLCheckCredentials(string? cred);
-
-    [DllImport("wlidcli.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    internal static extern int WLGetTicket(uint handle, out IntPtr ticket);
-
-    [DllImport("wlidcli.dll", SetLastError = true)]
-    internal static extern void WLFreeMemory(IntPtr pv);
-
-    // ---- uxctl.dll (all __stdcall) ----
-    [DllImport("uxctl.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    internal static extern int UxControlsInitProcess();
-
-    [DllImport("uxctl.dll", SetLastError = true)]
-    internal static extern void UxControlsUninitProcess();
-
-    [DllImport("uxctl.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    internal static extern int UxControlsCreateObject(out IntPtr ppObject);
-
-    // ---- WLXVideoTrim.dll (all __stdcall) ----
-    [LibraryImport("WLXVideoTrim.dll")]
-    internal static partial int CreateVideoPlayer(out IntPtr ppUnknown);
-
-    [LibraryImport("WLXVideoTrim.dll")]
-    internal static partial int CreateVideoFormatContextTranscoder(out IntPtr ppUnknown);
-
-    [LibraryImport("WLXVideoTrim.dll")]
-    internal static partial int CreateVideoWMVTranscoder(out IntPtr ppUnknown);
-
-    [LibraryImport("WLXVideoTrim.dll")]
-    internal static partial int CreateAVICopierDirect(out IntPtr ppUnknown);
-
-    // ---- WLXPipetran.dll (__stdcall) ----
-    [LibraryImport("WLXPipetran.dll")]
-    internal static partial int GetTFXCreateFunctions(out IntPtr ppFunctions, out uint pCount);
-
-    // ---- MovieMakerCore.dll (__cdecl) ----
-    [DllImport("MovieMakerCore.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
-    internal static extern int MovieMakerMain(int argc, string[] argv);
+        var unloadable = TestSkips.UnloadableDlls.Where(kv => !coverage.Data.TryGetValue(kv.Key, out var c) || c.Present == 0).ToList();
+        if (unloadable.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Skipped (DLL not loadable):");
+            foreach (var (dll, reason) in unloadable)
+                Console.WriteLine($"  [!] {dll} — {reason}");
+        }
+    }
 }
